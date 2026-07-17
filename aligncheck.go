@@ -1,9 +1,11 @@
 package aligncheck
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"io/fs"
 	"path/filepath"
@@ -46,7 +48,7 @@ func AssertAllInPackageAligned(t *testing.T, registry map[string]interface{}) {
 				if !ok {
 					return true
 				}
-				_, ok = typeSpec.Type.(*ast.StructType)
+				structType, ok := typeSpec.Type.(*ast.StructType)
 				if !ok {
 					return true
 				}
@@ -68,7 +70,23 @@ func AssertAllInPackageAligned(t *testing.T, registry map[string]interface{}) {
 					return true
 				}
 
-				AssertOptimalAlignmentWithSuggestions(t, instance, location)
+				// Map AST fields to their raw code-defined types
+				astFieldTypes := make(map[string]string)
+				for _, field := range structType.Fields.List {
+					typeStr := getASTTypeString(fset, field.Type)
+					for _, nameNode := range field.Names {
+						astFieldTypes[nameNode.Name] = typeStr
+					}
+					// Handle anonymous (embedded) fields
+					if len(field.Names) == 0 {
+						embedName := getEmbeddedFieldName(field.Type)
+						if embedName != "" {
+							astFieldTypes[embedName] = typeStr
+						}
+					}
+				}
+
+				AssertOptimalAlignmentWithSuggestions(t, instance, location, astFieldTypes)
 				return true
 			})
 		}
@@ -77,10 +95,25 @@ func AssertAllInPackageAligned(t *testing.T, registry map[string]interface{}) {
 
 // AssertOptimalAlignmentWithSuggestions checks the field order sorting,
 // isolates internal compiler padding, and suggests an optimal layout on failure.
-func AssertOptimalAlignmentWithSuggestions(t *testing.T, instance interface{}, location string) {
+func AssertOptimalAlignmentWithSuggestions(t *testing.T, instance interface{}, location string, astFieldTypes ...map[string]string) {
 	typ := reflect.TypeOf(instance)
 	if typ.Kind() != reflect.Struct {
 		return
+	}
+
+	var fieldTypeMap map[string]string
+	if len(astFieldTypes) > 0 {
+		fieldTypeMap = astFieldTypes[0]
+	}
+
+	// Helper to resolve AST type if available, falling back to reflection
+	getTypeStr := func(f reflect.StructField) string {
+		if fieldTypeMap != nil {
+			if astType, exists := fieldTypeMap[f.Name]; exists {
+				return astType
+			}
+		}
+		return f.Type.String()
 	}
 
 	t.Run("Alignment_"+typ.Name(), func(t *testing.T) {
@@ -98,7 +131,7 @@ func AssertOptimalAlignmentWithSuggestions(t *testing.T, instance interface{}, l
 			if f1.Type.Size() < f2.Type.Size() {
 				hasViolation = true
 				t.Errorf("[%s] Field alignment violation in '%s': field '%s' (%s, size %d bytes) appears before larger field '%s' (%s, size %d bytes).",
-					location, typ.Name(), f1.Name, f1.Type.String(), f1.Type.Size(), f2.Name, f2.Type.String(), f2.Type.Size())
+					location, typ.Name(), f1.Name, getTypeStr(f1), f1.Type.Size(), f2.Name, getTypeStr(f2), f2.Type.Size())
 			}
 		}
 
@@ -140,10 +173,33 @@ func AssertOptimalAlignmentWithSuggestions(t *testing.T, instance interface{}, l
 			var sb strings.Builder
 			sb.WriteString(fmt.Sprintf("\n[SUGGESTED ALIGNMENT] Modify '%s' at %s:\n\ntype %s struct {\n", typ.Name(), location, typ.Name()))
 			for _, f := range fields {
-				sb.WriteString(fmt.Sprintf("\t%-15s %-20s // %d bytes\n", f.Name, f.Type.String(), f.Type.Size()))
+				sb.WriteString(fmt.Sprintf("\t%-15s %-20s // %d bytes\n", f.Name, getTypeStr(f), f.Type.Size()))
 			}
 			sb.WriteString("}\n")
 			t.Log(sb.String())
 		}
 	})
+}
+
+// getASTTypeString converts an AST expression back into its literal source representation.
+func getASTTypeString(fset *token.FileSet, expr ast.Expr) string {
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, fset, expr); err != nil {
+		return ""
+	}
+	return buf.String()
+}
+
+// getEmbeddedFieldName returns the base name of an embedded/anonymous field.
+func getEmbeddedFieldName(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return getEmbeddedFieldName(t.X)
+	case *ast.SelectorExpr:
+		return t.Sel.Name
+	default:
+		return ""
+	}
 }

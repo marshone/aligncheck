@@ -121,7 +121,7 @@ Download and run the generator:
 
 ```bash
 # 1. Download the script
-curl -o gen-alignment-test.sh https://raw.githubusercontent.com/marshone/aligncheck/main/gen-alignment-test.sh
+curl -o gen-alignment-test.sh https://raw.githubusercontent.com/marshone/aligncheck/refs/heads/develop/gen-alignment-test.sh
 chmod +x gen-alignment-test.sh
 
 # 2. Run it against any package directory

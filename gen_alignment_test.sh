@@ -88,7 +88,10 @@ if [ "$#" -ne 1 ]; then
     exit 1
 fi
 
-TARGET_DIR="$1"
+TARGET_DIR="${1}"
+
+# Clean trailing slashes
+TARGET_DIR="${TARGET_DIR%"${TARGET_DIR##*[!/]}"}"
 
 if [ ! -d "$TARGET_DIR" ]; then
     echo "Error: Directory '$TARGET_DIR' does not exist."
@@ -157,4 +160,4 @@ if command -v gofmt >/dev/null 2>&1; then
     gofmt -w "$OUT_FILE"
 fi
 
-echo "Successfully wrote $OUT_FILE! Run 'go test -v ./$TARGET_DIR/...' to verify."
+echo "Successfully wrote $OUT_FILE! Run 'go test -v ${TARGET_DIR}/...' to verify."

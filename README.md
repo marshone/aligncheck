@@ -1,48 +1,57 @@
 # aligncheck
 
-`aligncheck` is a zero-dependency, test-driven struct alignment validator for Go. 
+`aligncheck` is a zero-dependency, test-driven struct alignment validator for Go.
 
-Unlike rigid CLI linters, `aligncheck` integrates directly into your native `go test` pipeline to protect your high-performance applications from silent memory bloat and cache line inefficiency—without breaking your coding workflow.
-
----
-
-## The Problem: Memory Layout & Compiler Padding
-
-In Go, the compiler aligns struct fields in memory based on their type sizes. If you declare small fields before large fields, the compiler is forced to insert invisible **padding bytes** to maintain correct CPU alignment boundaries. 
-
-This wastes RAM and degrades CPU cache performance (L1/L2) by bloating your structures.
-
-### The Traditional Solution (And Why It Sucks)
-* `govet fieldalignment`: A command-line tool that complains about layout errors but is clunky to run, noisy about trailing padding, and often runs outside of standard local testing pipelines.
-* Automated Rewriters: These tools overwrite your source files, but they notoriously **strip out or break your carefully placed inline comments and documentation**.
+Unlike standalone linters, `aligncheck` runs inside your normal `go test` pipeline. It protects performance-sensitive code from silent memory bloat and poor cache usage, without rewriting your source files or getting in the way of your workflow.
 
 ---
 
-## The `aligncheck` Solution: Interactive TDB
-`aligncheck` operates as a native Go unit test. If a struct layout is suboptimal:
-1. The test **fails** natively.
-2. It pinpoints the exact file and line number of the offending struct.
-3. It prints an optimal, type-annotated, **copy-pasteable struct blueprint** directly into your test terminal.
+## The Problem: Memory Layout and Compiler Padding
 
-This gives you all your comments and documentation completely intact.
+The Go compiler aligns every struct field on a boundary that matches its type. When a small field sits in front of a larger one, the compiler inserts invisible **padding bytes** to keep the larger field correctly aligned.
+
+That padding wastes memory and spreads your data over more CPU cache lines (L1/L2). For structs allocated by the thousands or millions, it adds up quickly.
+
+### Existing Tools, and Their Drawbacks
+
+- **`fieldalignment` (go vet analyzer):** reports layout problems, but runs as a separate step outside your usual test loop, and its output is noisy about trailing padding you can't remove anyway.
+- **Automatic rewriters:** reorder fields for you, but they tend to strip or misplace the comments and documentation attached to those fields.
+
+---
+
+## The `aligncheck` Approach: Test-Driven Layouts
+
+`aligncheck` is a regular Go unit test. When a struct layout is suboptimal:
+
+1. The test **fails**, like any other test.
+2. It points to the exact file and line of the struct.
+3. It prints a type-annotated, **copy-pasteable layout** in the test output.
+
+Your source file is never modified. You reorder the fields yourself, and your comments stay exactly where you put them.
 
 ---
 
 ## Installation
 
+Add the library to your module:
+
 ```bash
 go get github.com/marshone/aligncheck
+```
+
+Optionally, install the `aligncheck` command, which writes alignment tests for you (see [Bootstrapping Existing Packages](#bootstrapping-existing-packages)):
+
+```bash
+go install github.com/marshone/aligncheck/cmd/aligncheck@latest
 ```
 
 ---
 
 ## Quick Start
 
-### Step 1: Write a Struct Alignment Test
+### Step 1: Write an Alignment Test
 
-Create a `struct_alignment_test.go` file inside any package you want to audit. 
-
-Pass your structures into a registry map (this supports both exported and unexported structures). The package scanner will automatically locate their definitions in your codebase, match them to the registry, and run the alignment proofs.
+Create a `struct_alignment_test.go` file in the package you want to audit, and register its structs (exported and unexported) in a map:
 
 ```go
 package mypackage
@@ -54,99 +63,176 @@ import (
 )
 
 func TestStructAlignments(t *testing.T) {
-	// Register the structs you want to validate
 	registry := map[string]any{
 		"MyConfig":   MyConfig{},
-		"Session":    Session{},   // Public struct
-		"unexported": unexported{}, // Unexported struct
+		"Session":    Session{},
+		"unexported": unexported{},
 	}
 
 	aligncheck.AssertAllInPackageAligned(t, registry)
 }
 ```
 
+`AssertAllInPackageAligned` parses every non-test `.go` file in the package, finds each struct declaration, and checks it against the instance you registered.
+
+**Every struct in the package must be registered.** If a struct is declared but missing from the map, the test fails and tells you which one to add. New structs can't slip through unchecked.
+
 ### Step 2: Run Your Tests
 
-Run your tests using the standard Go toolchain:
-
 ```bash
-go test -v -run="StructAlignments" ./.
+go test -v -run=StructAlignments .
 ```
 
 ---
 
 ## Example Failure Output
 
-If a struct like this is registered:
+Given this struct:
 
 ```go
 type BrokenStruct struct {
-	IIsActive   bool     // 1 byte
-	DataBuffer []byte   // 24 bytes
-	Flag       boyte     // 1 byte
-	Name       string   // 16 bytes
-	CallbackID uint64   // 8 bytes
+	IsActive   bool   // 1 byte
+	DataBuffer []byte // 24 bytes
+	Flag       byte   // 1 byte
+	Name       string // 16 bytes
+	CallbackID uint64 // 8 bytes
 }
 ```
 
-Running `go test` will fail and output the following alignment blueprint to your terminal (preserving all of your original source type aliases):
+`go test -v` fails with the following output (64-bit platform). Source type names, including your own type aliases, are preserved in the messages and in the suggested layout.
 
 ```text
+=== RUN   TestStructAlignments/Alignment_BrokenStruct
+    aligncheck.go:133: [models.go:3] Field alignment violation in 'BrokenStruct': field 'IsActive' (bool, size 1 bytes) appears before larger field 'DataBuffer' ([]byte, size 24 bytes).
+    aligncheck.go:133: [models.go:3] Field alignment violation in 'BrokenStruct': field 'Flag' (byte, size 1 bytes) appears before larger field 'Name' (string, size 16 bytes).
+    aligncheck.go:157: [models.go:3] Struct 'BrokenStruct' contains 8 bytes of internal compiler padding. Actual size: 64, Optimal size: 56.
+    aligncheck.go:179:
+        [SUGGESTED ALIGNMENT] Modify 'BrokenStruct' at models.go:3:
+
+        type BrokenStruct struct {
+        	DataBuffer      []byte               // 24 bytes
+        	Name            string               // 16 bytes
+        	CallbackID      uint64               // 8 bytes
+        	IsActive        bool                 // 1 bytes
+        	Flag            byte                 // 1 bytes
+        }
+
 --- FAIL: TestStructAlignments (0.00s)
     --- FAIL: TestStructAlignments/Alignment_BrokenStruct (0.00s)
-        aligncheck.go:133: [sandbox.go:18] Field alignment violation in 'BrokenStruct': field 'IsActive' (bool, size 1 bytes) appears before larger field 'DataBuffer' ([]byte, size 24 bytes).
-        aligncheck.go:133: [sandbox.go:18] Field alignment violation in 'BrokenStruct': field 'Flag' (byte, size 1 bytes) appears before larger field 'Name' (string, size 16 bytes).
-        alignchech.go:157: [sandbox.go:18] Struct 'BrokenStruct' contains 16 bytes of internal compiler padding. Actual size: 64, Optimal size: 48.
-        aligncheck.go:179: 
-            
-            [SUGGESTED ALIGNMENT] Modify 'BrokenStruct' at sandbox.go:18:
-            
-            type BrokenStruct struct {
-            	DataBuffer      []bote               // 24 bytes
-            	CallbackID      uint64               // 8 bytes
-            	Name            string               // 16 bytes
-            	IsActive       bool                 // 1 bytes
-            	Flag            byte                 // 1 bytes
-            }
 ```
 
-Simply use the suggested layout as an inline guide in your editor to rearrange your fields, keeping your comments exactly where you want them.
+Where the numbers come from:
+
+| Layout | Field bytes | Padding | Total size |
+| --- | --- | --- | --- |
+| Current | 50 | 14 internal (7 after `IsActive`, 7 after `Flag`) | 64 |
+| Suggested | 50 | 6 trailing (unavoidable) | 56 |
+
+Reordering saves 8 bytes per instance. The 6 bytes of trailing padding remain in any order, because the struct's total size must be a multiple of its 8-byte alignment, so `aligncheck` doesn't count them against you.
+
+Use the suggested layout as a guide in your editor, move your fields, and keep your comments intact.
+
+---
+
+## How It Checks
+
+For each registered struct, `aligncheck` runs two checks:
+
+1. **Field order:** fields must be sorted by descending size. Each field placed before a larger one is reported.
+2. **Size:** the struct's actual size is compared with the smallest possible size, which is the sum of its field sizes rounded up to the struct's alignment. Any difference is reported as removable padding. Trailing padding that no ordering can remove is ignored.
+
+If either check fails, the suggested layout lists the fields sorted by descending size. Fields of equal size keep their original relative order.
+
+### Checking a Single Struct
+
+To check one struct without scanning the whole package, call the lower-level assertion directly:
+
+```go
+func TestSessionAlignment(t *testing.T) {
+	aligncheck.AssertOptimalAlignmentWithSuggestions(t, Session{}, "session.go")
+}
+```
+
+The third argument is a location label printed in the messages.
 
 ---
 
 ## Bootstrapping Existing Packages
 
-If you have a large package with dozens of structs, you don't need to write the test registry map by hand. `aligncheck` comes with a flexible, full-featured bootstrap shell utility `gen_alignment_test.sh` to automate this for you.
+For a package with dozens of structs, you don't have to write the registry by hand. The `aligncheck` command finds every struct declared in a package and generates the test file for you.
+
+### Install
+
+```bash
+go install github.com/marshone/aligncheck/cmd/aligncheck@latest
+```
+
+Go builds the command from source with your own toolchain and puts it in `$GOBIN`, or in `$GOPATH/bin` (usually `~/go/bin`) when `GOBIN` is unset. Make sure that directory is on your `PATH`.
+
+`@latest` is the newest release; use a tag such as `@v0.1.0` to pin a version. Downloads go through the Go module proxy and are verified against the Go checksum database.
+
+To run it once without installing:
+
+```bash
+go run github.com/marshone/aligncheck/cmd/aligncheck@latest gen ./internal/control
+```
+
+### Usage
+
+```bash
+# Generate an alignment test for a package (default file: struct_alignment_test.go)
+aligncheck gen ./internal/control
+
+# Use a custom file name prefix (e.g. zz_generated_alignment_test.go)
+aligncheck gen -prefix zz_generated_alignment ./internal/control
+
+# Regenerate after adding structs, overwriting the previously generated file
+aligncheck gen -f ./internal/control
+
+# List every generated alignment test under the current directory
+aligncheck ls
+
+# Show which generated tests would be removed, then remove them
+aligncheck clean
+aligncheck clean -y
+
+# Print the installed version
+aligncheck version
+```
+
+Flags go before the directory argument.
+
+### What `gen` Does
+
+- Registers every top-level struct in the package's non-test files, including structs declared in grouped `type ( … )` blocks.
+- Never overwrites a hand-written file, even with `-f`. Only files it generated can be replaced.
+- Refuses to run if another test file in the package already declares `TestStructAlignments`, since two would not compile.
+- Writes the same output for the same input: no timestamps, so regenerating doesn't create noise in your diffs.
+
+Generated files start with an `Auto Generated by github.com/marshone/aligncheck` line, which is how `ls` and `clean` recognize them (including files created by the earlier `gen_alignment_test.sh` script), and a standard `// Code generated … DO NOT EDIT.` line, which Go tooling and linters recognize.
+
+### Generic Structs
+
+A generic struct can't be registered without a type argument, so `gen` skips it with a warning. For packages with generic structs, generate the file once, add an instantiation to the registry yourself:
+
+```go
+"Cache": Cache[string]{},
+```
+
+and remove the two header lines. The file then becomes yours, and `aligncheck gen` will no longer overwrite it.
 
 ---
 
-### Download & Setup
+## Development
 
 ```bash
-curl -o gen_alignment_test.sh https://raw.githubusercontent.com/marshone/aligncheck/refs/heads/develop/gen_alignment_test.sh
-chmod +x gen_alignment_test.sh
+make test      # run all tests: library, CLI and the example self-test
+make demo      # show aligncheck failing on a deliberately broken struct
+make build     # build the CLI into bin/
+make install   # install the CLI into $GOBIN (or $GOPATH/bin)
 ```
 
-### Command Options & Usage
-
-Gracefully handles standard CLI actions and allows custom filename prefixes:
-
-```bash
-# 1. Show the complete command help menu
-./gen_alignment_test.sh --help
-
-# 2. Generate alignment tests for a control directory (Defaults: struct_alignment_test.go)
-./gen_alignment_test.sh ./internal/control
-
-# 3. List all packages with generated alignment tests currently in the repository
-./gen_alignment_test.sh ls
-
-# 4. Safely clean/remove all generated tests (only touches files created by this tool and user need to confirm)
-./gen_alignment_test.sh clean
-
-# 5. Customize the generated filename (e.g., zz_generated_alignment_test.go)
-ALIGNMENT_PREFIX=zz_generated_alignment ./gen_alignment_test.sh ./internal/control
-```
+`make demo` fails on purpose: `example/sandbox.go` contains a badly laid-out struct so you can see the full failure output. The regular suite stays green because it runs the same demo in a child process and checks that `aligncheck` reports the expected violations, sizes and suggested layout.
 
 ---
 

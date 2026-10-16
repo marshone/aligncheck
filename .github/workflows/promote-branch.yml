@@ -1,0 +1,136 @@
+# .github/workflows/promote-branch.yml
+name: Promote Branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: 'Source branch'
+        required: true
+        type: choice
+        options: [develop, staging]
+      target_branch:
+        description: 'Target branch'
+        required: true
+        type: choice
+        options: [staging, main]
+      version_bump:
+        description: 'Version type (only for develop → staging)'
+        required: false
+        type: choice
+        default: patch
+        options: [major, minor, patch]
+
+permissions:
+  contents: read
+
+jobs:
+  create-promotion-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write # labels
+    env:
+      SOURCE: ${{ inputs.source_branch }}
+      TARGET: ${{ inputs.target_branch }}
+      BUMP: ${{ inputs.version_bump }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Validate promotion path
+        run: |
+          case "$SOURCE→$TARGET" in
+            "develop→staging") echo "✅ Valid promotion: develop → staging (creating RC)" ;;
+            "staging→main")    echo "✅ Valid promotion: staging → main (stable version)" ;;
+            *)
+              echo "::error::Invalid promotion path: $SOURCE → $TARGET. Allowed: develop → staging, staging → main."
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Preview version
+        id: preview
+        run: |
+          if [ "$TARGET" = staging ]; then
+            next="$(.github/scripts/next-version.sh staging "$BUMP")"
+          else
+            next="$(.github/scripts/next-version.sh main)"
+          fi
+          echo "next_version=$next" >> "$GITHUB_OUTPUT"
+          echo "Next version: $next"
+
+      - name: Create promotion PR
+        env:
+          NEXT: ${{ steps.preview.outputs.next_version }}
+        run: |
+          if [ "$TARGET" = staging ]; then
+            title="🧪 Promote $SOURCE to $TARGET"
+            labels=(promotion qa "$BUMP")
+            cat > "$RUNNER_TEMP/body.md" <<EOF
+          ## 🧪 Promotion to Staging (QA)
+
+          This PR promotes changes from \`$SOURCE\` to \`$TARGET\` for QA validation.
+
+          ### Expected Version
+          **$NEXT** ($BUMP)
+
+          ### QA Checklist
+          - [ ] Functional tests pass
+          - [ ] Regression tests OK
+          - [ ] Performance tests OK
+          - [ ] Documentation validated
+          - [ ] Ready for production
+
+          **Note:** Once merged, tag \`$NEXT\` will be automatically created.
+          EOF
+          else
+            title="🚀 Promote $SOURCE to $TARGET"
+            labels=(promotion production)
+            cat > "$RUNNER_TEMP/body.md" <<EOF
+          ## 🚀 Promotion to Production
+
+          This PR promotes changes from \`$SOURCE\` to \`$TARGET\`.
+
+          ### Expected Version
+          **$NEXT** (stable)
+
+          ### Final Checklist
+          - [ ] Complete QA validation performed
+          - [ ] No blocking bugs
+          - [ ] Rollback plan prepared
+          - [ ] Team notified
+          - [ ] Release documentation ready
+
+          **Note:** Once merged, stable tag \`$NEXT\` will be automatically created.
+          EOF
+          fi
+          printf '\n---\n**Triggered by:** @%s\n' "$GITHUB_ACTOR" >> "$RUNNER_TEMP/body.md"
+
+          # gh refuses unknown labels, so make sure they exist first.
+          for label in "${labels[@]}"; do
+            gh label create "$label" --force >/dev/null
+          done
+          label_args=()
+          for label in "${labels[@]}"; do label_args+=(--label "$label"); done
+
+          if ! url="$(gh pr create --base "$TARGET" --head "$SOURCE" --title "$title" \
+                --body-file "$RUNNER_TEMP/body.md" "${label_args[@]}" 2>&1)"; then
+            echo "::error::Could not create the PR $SOURCE → $TARGET: $url"
+            exit 1
+          fi
+
+          {
+            echo "### ✅ Promotion PR created"
+            echo
+            echo "**Version:** $NEXT"
+            echo
+            echo "$url"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "✅ PR created: $url"

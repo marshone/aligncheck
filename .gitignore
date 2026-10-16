@@ -24,9 +24,14 @@ profile.cov
 go.work
 go.work.sum
 
+# Go binary directory
+/bin/
+
 # env file
 .env
 
+# kzio local configuration
+.kzio.env.local
+
 # Editor/IDE
-# .idea/
-# .vscode/
+.vscode/

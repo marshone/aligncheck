@@ -4,6 +4,8 @@
 // Usage:
 //
 //	aligncheck gen [-prefix name] [-f] <package-dir>
+//	aligncheck test [go test flags] [packages]
+//	aligncheck inspect [-arch name] [-v] [packages]
 //	aligncheck ls [root]
 //	aligncheck clean [-y] [root]
 //	aligncheck version
@@ -19,6 +21,7 @@ import (
 	"go/token"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
@@ -33,6 +36,8 @@ const usageText = `aligncheck - manage struct alignment tests
 
 Usage:
   aligncheck gen [-prefix name] [-f] <package-dir>   generate <prefix>_test.go for a package
+  aligncheck test [go test flags] [packages]         run the alignment tests (go test -run TestStructAlignments)
+  aligncheck inspect [-arch name] [-v] [packages]    report struct layouts directly, without tests
   aligncheck ls [root]                               list generated alignment tests
   aligncheck clean [-y] [root]                       remove generated alignment tests
   aligncheck version                                 print the version
@@ -50,6 +55,10 @@ func main() {
 	switch os.Args[1] {
 	case "gen":
 		err = runGen(os.Args[2:])
+	case "test":
+		err = runTest(os.Args[2:])
+	case "inspect":
+		err = runInspect(os.Args[2:])
 	case "ls":
 		err = runLs(os.Args[2:])
 	case "clean":
@@ -93,6 +102,20 @@ func runGen(args []string) error {
 	}
 	fmt.Printf("wrote %s (%d structs)\n", res.Path, len(res.Structs))
 	return nil
+}
+
+// runTest runs the alignment tests through go test, passing every argument
+// through, and exits with go test's own exit code.
+func runTest(args []string) error {
+	goArgs := append([]string{"test", "-run", "^TestStructAlignments$", "-count=1"}, args...)
+	cmd := exec.Command("go", goArgs...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		os.Exit(exitErr.ExitCode())
+	}
+	return err
 }
 
 func runLs(args []string) error {

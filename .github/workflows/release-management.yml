@@ -1,0 +1,149 @@
+# .github/workflows/release-management.yml
+name: Release Management
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [staging, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-management
+  cancel-in-progress: false
+
+jobs:
+  create-version:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      # Event data goes through env, never pasted into scripts.
+      TARGET_BRANCH: ${{ github.event.pull_request.base.ref }}
+      MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      # Check out the merge commit that actually landed on the branch,
+      # not the synthetic refs/pull/N/merge commit.
+      - name: Checkout merge commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "$TARGET_BRANCH" = staging ]; then
+            bump="patch"
+            if [[ ",$PR_LABELS," == *",major,"* || "${PR_TITLE^^}" == *"BREAKING CHANGE"* ]]; then
+              bump="major"
+            elif [[ ",$PR_LABELS," == *",minor,"* || ",$PR_LABELS," == *",feature,"* ]]; then
+              bump="minor"
+            fi
+            version="$(.github/scripts/next-version.sh staging "$bump")"
+            prerelease=true
+          else
+            version="$(.github/scripts/next-version.sh main)"
+            prerelease=false
+          fi
+
+          if git rev-parse -q --verify "refs/tags/$version" >/dev/null; then
+            exists=true
+          else
+            exists=false
+          fi
+
+          {
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+            echo "exists=$exists"
+          } >> "$GITHUB_OUTPUT"
+          echo "Version: $version (prerelease=$prerelease, exists=$exists)"
+
+      # Notes are computed before the new tag exists, so the first RC
+      # compares against the previous release instead of itself.
+      - name: Generate release notes
+        if: steps.version.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          stable="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+          if [ "$TARGET_BRANCH" = staging ]; then
+            previous="$(git tag -l 'v*-rc.*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$' | sort -V | tail -n1 || true)"
+            previous="${previous:-$stable}"
+            heading="## 🧪 Release Candidate"
+            summary="This version is undergoing QA validation."
+          else
+            previous="$stable"
+            heading="## 🚀 Production Release"
+            summary="This version has been validated and is ready for production."
+          fi
+          range="$MERGE_SHA"
+          [ -n "$previous" ] && range="$previous..$MERGE_SHA"
+
+          {
+            echo "$heading"
+            echo
+            echo "$summary"
+            echo
+            echo "### Changes"
+            echo
+            git log "$range" --no-merges --pretty=format:'- %s (%h)'
+            echo
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Create tag
+        if: steps.version.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" "$MERGE_SHA" -m "Release $VERSION"
+          git push origin "refs/tags/$VERSION"
+
+      - name: Create GitHub release
+        if: steps.version.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          if [ "$PRERELEASE" = true ]; then kind=--prerelease; else kind=--latest; fi
+          gh release create "$VERSION" --verify-tag --title "$VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" "$kind"
+
+      # Ask the Go module proxy for the new version, so `go install @latest`
+      # and pkg.go.dev see it right away. Best effort, never fails the job.
+      - name: Announce to the Go module proxy
+        if: steps.version.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          curl -fsS "https://proxy.golang.org/github.com/${GITHUB_REPOSITORY,,}/@v/$VERSION.info" || true
+
+      - name: Comment on PR
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          EXISTS: ${{ steps.version.outputs.exists }}
+        run: |
+          if [ "$EXISTS" = true ]; then
+            body="⚠️ Tag \`$VERSION\` already exists. No new release created."
+          else
+            if [ "$PRERELEASE" = true ]; then kind="🧪 **Release Candidate created:**"; else kind="🚀 **Production Release created:**"; fi
+            body="$kind $VERSION
+
+          This merge to \`$TARGET_BRANCH\` has automatically created a new version.
+
+          [View release]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$VERSION)"
+          fi
+          gh pr comment "$PR_NUMBER" --body "$body"

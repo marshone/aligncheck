@@ -58,3 +58,10 @@ type BrokenStruct struct {
 	// Functions (8 bytes)
 	OnError func(err error)
 }
+
+// helper declares a struct inside a function body; it is not a package-level
+// type, so it must not be required in the registry.
+func helper() int {
+	type local struct{ X int }
+	return local{X: 1}.X
+}

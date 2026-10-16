@@ -10,32 +10,53 @@ import (
 	"io/fs"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strings"
 	"testing"
+
+	"github.com/marshone/aligncheck/internal/layout"
 )
 
 /*
-Go Type Size Cheat Sheet (64-bit Architectures)
-Size 	Go Types / Structures
-32 	Bytesnetip.AddrPort
-24 	Bytestime.Time, slices ([]T), strings (wait, strings are 16 bytes: ptr + len. Slices are 24 bytes: ptr + len + cap)
-16 	Bytesstring, interfaces (interface{} / any), netip.Addr
-8 	BytesAll pointers (*T), maps, channels, functions (func), int64, uint64, float64
-4 	Bytesint32, uint32, float32, rune
-2 	Bytesint16, uint16
-1 	Byteint8, uint8, byte, bool
+Go type size cheat sheet (64-bit architectures)
+
+Size  Go types
+32    netip.AddrPort
+24    slices ([]T), time.Time, netip.Addr
+16    strings, interfaces (interface{} / any)
+8     pointers (*T), maps, channels, functions (func), int, int64, uint64, float64, uintptr
+4     int32, uint32, float32, rune
+2     int16, uint16
+1     int8, uint8, byte, bool
+0     struct{}, [0]T
 */
 
-// AssertAllInPackageAligned automatically parses every production struct declared
-// in the current package directory and runs optimal alignment checks on it.
-func AssertAllInPackageAligned(t *testing.T, registry map[string]interface{}) {
-	fset := token.NewFileSet()
+// Option configures AssertAllInPackageAligned.
+type Option func(*config)
 
+type config struct {
+	strictOrder bool
+}
+
+// WithStrictOrder also requires fields to be declared in descending size order,
+// even where reordering would not save any memory. Use it to enforce a layout
+// convention; without it, a struct fails only when reordering would shrink it.
+func WithStrictOrder() Option {
+	return func(c *config) { c.strictOrder = true }
+}
+
+// AssertAllInPackageAligned parses every top-level struct declared in the
+// current package directory and checks that no field reordering would make it
+// smaller. Every struct must be registered, so new ones can't slip through.
+func AssertAllInPackageAligned(t *testing.T, registry map[string]interface{}, opts ...Option) {
+	var cfg config
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	fset := token.NewFileSet()
 	filter := func(info fs.FileInfo) bool {
 		return !strings.HasSuffix(info.Name(), "_test.go")
 	}
-
 	pkgs, err := parser.ParseDir(fset, ".", filter, parser.AllErrors)
 	if err != nil {
 		t.Fatalf("failed to parse package files: %v", err)
@@ -43,142 +64,129 @@ func AssertAllInPackageAligned(t *testing.T, registry map[string]interface{}) {
 
 	for _, pkg := range pkgs {
 		for _, file := range pkg.Files {
-			ast.Inspect(file, func(n ast.Node) bool {
-				typeSpec, ok := n.(*ast.TypeSpec)
-				if !ok {
-					return true
+			// Only top-level declarations: a struct declared inside a function
+			// can't be registered from a test.
+			for _, decl := range file.Decls {
+				gen, ok := decl.(*ast.GenDecl)
+				if !ok || gen.Tok != token.TYPE {
+					continue
 				}
-				structType, ok := typeSpec.Type.(*ast.StructType)
-				if !ok {
-					return true
-				}
-
-				structName := typeSpec.Name.Name
-
-				pos := fset.Position(typeSpec.Pos())
-				relPath, err := filepath.Rel(".", pos.Filename)
-				if err != nil {
-					relPath = pos.Filename
-				}
-				location := fmt.Sprintf("%s:%d", relPath, pos.Line)
-
-				instance, registered := registry[structName]
-				if !registered {
-					t.Fatalf("[%s] Struct %q is declared but NOT registered in alignment test! "+
-						"Please add %s{} to your test registry map to ensure it is validated.",
-						location, structName, structName)
-					return true
-				}
-
-				// Map AST fields to their raw code-defined types
-				astFieldTypes := make(map[string]string)
-				for _, field := range structType.Fields.List {
-					typeStr := getASTTypeString(fset, field.Type)
-					for _, nameNode := range field.Names {
-						astFieldTypes[nameNode.Name] = typeStr
+				for _, spec := range gen.Specs {
+					typeSpec := spec.(*ast.TypeSpec)
+					structType, ok := typeSpec.Type.(*ast.StructType)
+					if !ok || typeSpec.Assign.IsValid() {
+						continue // not a struct, or an alias
 					}
-					// Handle anonymous (embedded) fields
-					if len(field.Names) == 0 {
-						embedName := getEmbeddedFieldName(field.Type)
-						if embedName != "" {
-							astFieldTypes[embedName] = typeStr
+
+					structName := typeSpec.Name.Name
+					pos := fset.Position(typeSpec.Pos())
+					relPath, err := filepath.Rel(".", pos.Filename)
+					if err != nil {
+						relPath = pos.Filename
+					}
+					location := fmt.Sprintf("%s:%d", relPath, pos.Line)
+
+					instance, registered := registry[structName]
+					if !registered {
+						t.Fatalf("%s: struct %s is declared but not registered in the alignment test: "+
+							"add %q: %s{} to the registry map", location, structName, structName, structName)
+					}
+
+					// Map AST fields to their raw code-defined types
+					astFieldTypes := make(map[string]string)
+					for _, field := range structType.Fields.List {
+						typeStr := getASTTypeString(fset, field.Type)
+						for _, nameNode := range field.Names {
+							astFieldTypes[nameNode.Name] = typeStr
+						}
+						// Handle anonymous (embedded) fields
+						if len(field.Names) == 0 {
+							if embedName := getEmbeddedFieldName(field.Type); embedName != "" {
+								astFieldTypes[embedName] = typeStr
+							}
 						}
 					}
-				}
 
-				AssertOptimalAlignmentWithSuggestions(t, instance, location, astFieldTypes)
-				return true
-			})
+					check(t, instance, location, astFieldTypes, cfg)
+				}
+			}
 		}
 	}
 }
 
-// AssertOptimalAlignmentWithSuggestions checks the field order sorting,
-// isolates internal compiler padding, and suggests an optimal layout on failure.
+// AssertOptimalAlignmentWithSuggestions checks one struct: it fails when a field
+// reordering would make the struct smaller, and logs the optimal layout.
 func AssertOptimalAlignmentWithSuggestions(t *testing.T, instance interface{}, location string, astFieldTypes ...map[string]string) {
-	typ := reflect.TypeOf(instance)
-	if typ.Kind() != reflect.Struct {
-		return
-	}
-
 	var fieldTypeMap map[string]string
 	if len(astFieldTypes) > 0 {
 		fieldTypeMap = astFieldTypes[0]
 	}
+	check(t, instance, location, fieldTypeMap, config{})
+}
 
-	// Helper to resolve AST type if available, falling back to reflection
-	getTypeStr := func(f reflect.StructField) string {
-		if fieldTypeMap != nil {
-			if astType, exists := fieldTypeMap[f.Name]; exists {
-				return astType
-			}
+// fieldsOf describes a struct's fields for the layout engine: sizes and
+// alignments from reflect, type text as written in the source when known.
+func fieldsOf(typ reflect.Type, fieldTypeMap map[string]string) []layout.Field {
+	fields := make([]layout.Field, typ.NumField())
+	for i := range fields {
+		f := typ.Field(i)
+		typeText := f.Type.String()
+		if astType, ok := fieldTypeMap[f.Name]; ok {
+			typeText = astType
 		}
-		return f.Type.String()
+		name := f.Name
+		if f.Anonymous {
+			name = "" // embedded fields are written as just their type
+		}
+		fields[i] = layout.Field{Name: name, Type: typeText,
+			Size: int64(f.Type.Size()), Align: int64(f.Type.FieldAlign())}
 	}
+	return fields
+}
+
+func check(t *testing.T, instance interface{}, location string, fieldTypeMap map[string]string, cfg config) {
+	t.Helper()
+	typ := reflect.TypeOf(instance)
+	if typ.Kind() != reflect.Struct {
+		return
+	}
+	fields := fieldsOf(typ, fieldTypeMap)
+	r := layout.Analyze(location, typ.Name(), fields, int64(typ.Align()))
 
 	t.Run("Alignment_"+typ.Name(), func(t *testing.T) {
-		hasViolation := false
+		failed := false
 
-		// 1. Verify fields are sorted descending by size
-		for i := 0; i < typ.NumField()-1; i++ {
-			f1 := typ.Field(i)
-			f2 := typ.Field(i + 1)
-
-			if f1.Type.Size() == 0 || f2.Type.Size() == 0 {
-				continue
+		// Optional convention: fields declared in descending size order.
+		if cfg.strictOrder {
+			for i := 0; i+1 < len(fields); i++ {
+				f1, f2 := fields[i], fields[i+1]
+				if f1.Size > 0 && f2.Size > 0 && f1.Size < f2.Size {
+					failed = true
+					t.Errorf("%s: %s: field %s (%s, %s) is declared before larger field %s (%s, %s) [strict order]",
+						location, typ.Name(), displayName(f1), f1.Type, layout.Plural(f1.Size, "byte"),
+						displayName(f2), f2.Type, layout.Plural(f2.Size, "byte"))
+				}
 			}
-
-			if f1.Type.Size() < f2.Type.Size() {
-				hasViolation = true
-				t.Errorf("[%s] Field alignment violation in '%s': field '%s' (%s, size %d bytes) appears before larger field '%s' (%s, size %d bytes).",
-					location, typ.Name(), f1.Name, getTypeStr(f1), f1.Type.Size(), f2.Name, getTypeStr(f2), f2.Type.Size())
-			}
+			// The suggestion must satisfy the strict rule itself.
+			r.Suggested = layout.DescendingSize(fields)
 		}
 
-		// 2. Identify and isolate internal padding (ignoring trailing padding)
-		largestFieldAlign := uintptr(1)
-		for i := 0; i < typ.NumField(); i++ {
-			f := typ.Field(i)
-			if f.Type.Align() > int(largestFieldAlign) {
-				largestFieldAlign = uintptr(f.Type.Align())
-			}
+		if r.Optimal < r.Size {
+			failed = true
+			t.Errorf("%s: %s", location, r.Headline())
 		}
 
-		sumOfFields := uintptr(0)
-		for i := 0; i < typ.NumField(); i++ {
-			sumOfFields += typ.Field(i).Type.Size()
-		}
-
-		expectedOptimalSize := (sumOfFields + largestFieldAlign - 1) &^ (largestFieldAlign - 1)
-
-		if typ.Size() > expectedOptimalSize {
-			hasViolation = true
-			internalPadding := typ.Size() - expectedOptimalSize
-			t.Errorf("[%s] Struct '%s' contains %d bytes of internal compiler padding. Actual size: %d, Optimal size: %d.",
-				location, typ.Name(), internalPadding, typ.Size(), expectedOptimalSize)
-		}
-
-		// 3. Print Suggestion on Failure
-		if hasViolation {
-			fields := make([]reflect.StructField, typ.NumField())
-			for i := 0; i < typ.NumField(); i++ {
-				fields[i] = typ.Field(i)
-			}
-
-			// Sort stable to keep user's equal-sized fields in their relative order
-			sort.SliceStable(fields, func(i, j int) bool {
-				return fields[i].Type.Size() > fields[j].Type.Size()
-			})
-
-			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("\n[SUGGESTED ALIGNMENT] Modify '%s' at %s:\n\ntype %s struct {\n", typ.Name(), location, typ.Name()))
-			for _, f := range fields {
-				sb.WriteString(fmt.Sprintf("\t%-15s %-20s // %d bytes\n", f.Name, getTypeStr(f), f.Type.Size()))
-			}
-			sb.WriteString("}\n")
-			t.Log(sb.String())
+		if failed {
+			t.Log("\n" + r.CurrentLayout() + "\n" + r.SuggestedLayout())
 		}
 	})
+}
+
+func displayName(f layout.Field) string {
+	if f.Name == "" {
+		return f.Type
+	}
+	return f.Name
 }
 
 // getASTTypeString converts an AST expression back into its literal source representation.

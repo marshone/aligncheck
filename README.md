@@ -25,7 +25,7 @@ That padding wastes memory and spreads your data over more CPU cache lines (L1/L
 
 1. The test **fails**, like any other test.
 2. It points to the exact file and line of the struct.
-3. It prints a type-annotated, **copy-pasteable layout** in the test output.
+3. It shows where the padding sits, and prints a type-annotated, **copy-pasteable layout** in the test output.
 
 Your source file is never modified. You reorder the fields yourself, and your comments stay exactly where you put them.
 
@@ -39,7 +39,7 @@ Add the library to your module:
 go get github.com/marshone/aligncheck
 ```
 
-Optionally, install the `aligncheck` command, which writes alignment tests for you (see [Bootstrapping Existing Packages](#bootstrapping-existing-packages)):
+Optionally, install the `aligncheck` command, which writes and runs alignment tests for you and can inspect struct layouts without any test (see [Bootstrapping Existing Packages](#bootstrapping-existing-packages)):
 
 ```bash
 go install github.com/marshone/aligncheck/cmd/aligncheck@latest
@@ -103,23 +103,31 @@ type BrokenStruct struct {
 
 ```text
 === RUN   TestStructAlignments/Alignment_BrokenStruct
-    aligncheck.go:133: [models.go:3] Field alignment violation in 'BrokenStruct': field 'IsActive' (bool, size 1 bytes) appears before larger field 'DataBuffer' ([]byte, size 24 bytes).
-    aligncheck.go:133: [models.go:3] Field alignment violation in 'BrokenStruct': field 'Flag' (byte, size 1 bytes) appears before larger field 'Name' (string, size 16 bytes).
-    aligncheck.go:157: [models.go:3] Struct 'BrokenStruct' contains 8 bytes of internal compiler padding. Actual size: 64, Optimal size: 56.
-    aligncheck.go:179:
-        [SUGGESTED ALIGNMENT] Modify 'BrokenStruct' at models.go:3:
+    aligncheck.go:176: models.go:3: BrokenStruct: 64 bytes (50 data + 14 padding), could be 56 (saves 8)
+    aligncheck.go:180:
+            current layout:
+                0  IsActive   bool   // 1 byte
+                1  (padding)         // 7 bytes
+                8  DataBuffer []byte // 24 bytes
+               32  Flag       byte   // 1 byte
+               33  (padding)         // 7 bytes
+               40  Name       string // 16 bytes
+               56  CallbackID uint64 // 8 bytes
 
-        type BrokenStruct struct {
-        	DataBuffer      []byte               // 24 bytes
-        	Name            string               // 16 bytes
-        	CallbackID      uint64               // 8 bytes
-        	IsActive        bool                 // 1 bytes
-        	Flag            byte                 // 1 bytes
-        }
+            suggested layout:
+            type BrokenStruct struct {
+                DataBuffer []byte // 24 bytes
+                Name       string // 16 bytes
+                CallbackID uint64 // 8 bytes
+                IsActive   bool   // 1 byte
+                Flag       byte   // 1 byte
+            }
 
 --- FAIL: TestStructAlignments (0.00s)
     --- FAIL: TestStructAlignments/Alignment_BrokenStruct (0.00s)
 ```
+
+The first line uses the compiler's `file:line: message` form, so editors make it clickable. The same report, word for word, is what `aligncheck inspect -v` prints for this struct.
 
 Where the numbers come from:
 
@@ -136,12 +144,21 @@ Use the suggested layout as a guide in your editor, move your fields, and keep y
 
 ## How It Checks
 
-For each registered struct, `aligncheck` runs two checks:
+For each registered struct, `aligncheck` computes the smallest size any field order can reach and compares it with the struct's actual size. Every Go type's size is a multiple of its alignment, so sorting fields by decreasing alignment leaves no internal padding; zero-size fields go first, because a trailing zero-size field makes the compiler add padding.
 
-1. **Field order:** fields must be sorted by descending size. Each field placed before a larger one is reported.
-2. **Size:** the struct's actual size is compared with the smallest possible size, which is the sum of its field sizes rounded up to the struct's alignment. Any difference is reported as removable padding. Trailing padding that no ordering can remove is ignored.
+A struct fails only when reordering would make it smaller. Padding that can only move, such as the 6 trailing bytes above, never fails a test.
 
-If either check fails, the suggested layout lists the fields sorted by descending size. Fields of equal size keep their original relative order.
+When a struct fails, the suggested layout is that optimal order. Fields of equal alignment and size keep their original relative order.
+
+### Strict Field Order
+
+Some teams prefer a fixed convention: fields always declared in descending size order, even where that saves no memory. Opt in with `WithStrictOrder`:
+
+```go
+aligncheck.AssertAllInPackageAligned(t, registry, aligncheck.WithStrictOrder())
+```
+
+Each field placed before a larger one is then reported as well, and the suggested layout follows descending size.
 
 ### Checking a Single Struct
 
@@ -196,6 +213,14 @@ aligncheck ls
 aligncheck clean
 aligncheck clean -y
 
+# Run the alignment tests (go test -run TestStructAlignments); go test flags pass through
+aligncheck test ./...
+aligncheck test -v ./internal/control
+
+# Report struct layouts directly, without any test file (see below); -v adds offsets
+aligncheck inspect ./...
+aligncheck inspect -v ./internal/control
+
 # Print the installed version
 aligncheck version
 ```
@@ -210,6 +235,55 @@ Flags go before the directory argument.
 - Writes the same output for the same input: no timestamps, so regenerating doesn't create noise in your diffs.
 
 Generated files start with an `Auto Generated by github.com/marshone/aligncheck` line, which is how `ls` and `clean` recognize them (including files created by the earlier `gen_alignment_test.sh` script), and a standard `// Code generated … DO NOT EDIT.` line, which Go tooling and linters recognize.
+
+### Inspecting Without Tests
+
+`aligncheck inspect` reads a package's source and reports the layout of every top-level struct. It writes no file, needs no test, and doesn't require `aligncheck` in your `go.mod`, so it's the quickest way to try `aligncheck` on any codebase:
+
+```bash
+aligncheck inspect ./...
+```
+
+Each struct gets one line: its size, how much of it is data and how much is padding, and a verdict. When a reordering can shrink it, the suggested layout follows:
+
+```text
+example/sandbox.go:9: AlignedStruct: 48 bytes (48 data + 0 padding), optimal, no padding
+example/sandbox.go:18: BrokenStruct: 168 bytes (147 data + 21 padding), could be 152 (saves 16)
+
+    suggested layout:
+    type BrokenStruct struct {
+        DataBuffer   []byte          // 24 bytes
+        CreatedAt    time.Time       // 24 bytes
+        ...
+        Priority     int8            // 1 byte
+    }
+
+2 structs inspected (amd64): 21 bytes of padding, 16 bytes removable by reordering 1 struct
+```
+
+Padding isn't always removable. A struct's size must be a multiple of its alignment, so some padding can only move, not disappear:
+
+```text
+internal/engine/memory.go:6: BranchState: 40 bytes (37 data + 3 padding), optimal: the 3 padding bytes are unavoidable
+```
+
+Add `-v` to see where the padding sits, field by field. Holes between fields are marked `(padding)`; padding at the end is `(trailing padding)`:
+
+```text
+    current layout:
+        0  Name     string   // 16 bytes
+       16  Head     uint64   // 8 bytes
+       24  Dialect  uint32   // 4 bytes
+       28  Lifetime Lifetime // 1 byte
+       29  (padding)         // 3 bytes
+       32  Gen      uint64   // 8 bytes
+```
+
+Trailing padding that no reordering can remove is free space: in a struct with 3 bytes of it, up to three 1-byte fields can be added without the struct growing.
+
+Sizes come from Go's own type checker for the target architecture; `-arch` selects another one (for example `-arch 386` or `-arch arm64`).
+
+`inspect` and the alignment test use the same calculation, so they agree: a struct `inspect` reports as optimal passes the test, unless you opted into `WithStrictOrder`.
 
 ### Generic Structs
 

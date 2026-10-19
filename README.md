@@ -220,6 +220,8 @@ aligncheck test -v ./internal/control
 # Report struct layouts directly, without any test file (see below); -v adds offsets
 aligncheck inspect ./...
 aligncheck inspect -v ./internal/control
+aligncheck inspect -heap ./...          # + heap allocation size and GC scan length
+aligncheck inspect -heap-first ./...    # + suggest pointer fields first
 
 # Print the installed version
 aligncheck version
@@ -264,24 +266,73 @@ example/sandbox.go:18: BrokenStruct: 168 bytes (147 data + 21 padding), could be
 Padding isn't always removable. A struct's size must be a multiple of its alignment, so some padding can only move, not disappear:
 
 ```text
-internal/engine/memory.go:6: BranchState: 40 bytes (37 data + 3 padding), optimal: the 3 padding bytes are unavoidable
+store/record.go:3: Record: 40 bytes (37 data + 3 padding), optimal: the 3 padding bytes are unavoidable
 ```
 
 Add `-v` to see where the padding sits, field by field. Holes between fields are marked `(padding)`; padding at the end is `(trailing padding)`:
 
 ```text
     current layout:
-        0  Name     string   // 16 bytes
-       16  Head     uint64   // 8 bytes
-       24  Dialect  uint32   // 4 bytes
-       28  Lifetime Lifetime // 1 byte
-       29  (padding)         // 3 bytes
-       32  Gen      uint64   // 8 bytes
+        0  Name    string // 16 bytes
+       16  ID      uint64 // 8 bytes
+       24  Version uint32 // 4 bytes
+       28  Kind    uint8  // 1 byte
+       29  (padding)      // 3 bytes
+       32  Created int64  // 8 bytes
 ```
 
 Trailing padding that no reordering can remove is free space: in a struct with 3 bytes of it, up to three 1-byte fields can be added without the struct growing.
 
 Sizes come from Go's own type checker for the target architecture; `-arch` selects another one (for example `-arch 386` or `-arch arm64`).
+
+### Heap and GC View
+
+Padding is only part of what a struct costs. Add `-heap` to see what the runtime actually spends on it:
+
+```bash
+aligncheck inspect -heap ./...
+```
+
+```text
+store/tree.go:3: TreeNode: 56 bytes (53 data + 3 padding), optimal: the 3 padding bytes are unavoidable
+    heap: allocated as 64 bytes (8 bytes of size-class slack) · GC scans 32 of 56 bytes
+api/events.go:3: Event: 88 bytes (78 data + 10 padding), could be 80 (saves 8)
+    heap: allocated as 96 bytes, could be 80 (saves 16) · GC scans 64 of 88 bytes, could be 32
+```
+
+- **Allocated as:** the heap rounds every allocation up to a size class (…, 48, 64, 80, 96, …). An 88-byte struct allocated on its own (`&T{}`, `new(T)`) takes a 96-byte slot, so shrinking it to 80 saves 16 bytes per allocation, not 8. Since Go 1.22, objects with pointers larger than 512 bytes also carry an 8-byte header. Values stored inside slices or other structs are packed, so for them only the plain size counts.
+- **GC scans:** the garbage collector scans each object only up to its last pointer word. Fields without pointers placed after that are never looked at. `string`, slices and pointers have a pointer in their first word; an interface has two.
+
+For structs allocated in bulk, both translate directly into CPU: fewer bytes allocated means fewer collections, and a shorter scan means less work per collection.
+
+With `-v -heap`, fields holding pointers are marked and the layout shows where the scan stops:
+
+```text
+       16  Name    string     // 16 bytes, pointer
+       ...
+       56  Tags    []string   // 24 bytes, pointer
+           -- GC scan ends at 64 --
+       80  Urgent  bool       // 1 byte
+```
+
+`-heap-first` (which implies `-heap`) goes one step further: among layouts of the same size, it suggests the one the GC scans least, putting pointer fields first. It also suggests a reordering for structs that are already optimal in size when that shortens the scan:
+
+```text
+store/tree.go:3: TreeNode: 56 bytes (53 data + 3 padding), optimal: the 3 padding bytes are unavoidable
+    heap: allocated as 64 bytes (8 bytes of size-class slack) · GC scans 32 of 56 bytes, could be 16
+
+    suggested layout:
+    type TreeNode struct {
+        Parent  *TreeNode // 8 bytes, pointer
+        Keys    []uint32  // 24 bytes, pointer
+        Created int64     // 8 bytes
+        ID      uint64    // 8 bytes
+        Level   uint32    // 4 bytes
+        Color   uint8     // 1 byte
+    }
+```
+
+The size classes and the allocation header are checked by a test that measures real allocations on the running Go version, so a change in a future runtime shows up in CI.
 
 `inspect` and the alignment test use the same calculation, so they agree: a struct `inspect` reports as optimal passes the test, unless you opted into `WithStrictOrder`.
 

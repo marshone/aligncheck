@@ -131,8 +131,8 @@ func fieldsOf(typ reflect.Type, fieldTypeMap map[string]string) []layout.Field {
 	for i := range fields {
 		f := typ.Field(i)
 		typeText := f.Type.String()
-		if astType, ok := fieldTypeMap[f.Name]; ok {
-			typeText = astType
+		if astType, ok := fieldTypeMap[f.Name]; ok && !strings.Contains(astType, "\n") {
+			typeText = astType // as written, unless it spans several lines
 		}
 		name := f.Name
 		if f.Anonymous {

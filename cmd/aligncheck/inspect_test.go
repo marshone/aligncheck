@@ -2,10 +2,16 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
+	"unsafe"
+
+	"github.com/marshone/aligncheck/internal/layout"
 )
 
 const inspectFixture = `package pkg
@@ -83,7 +89,7 @@ func inModule(t *testing.T, fn func()) {
 func TestInspectReportsLayouts(t *testing.T) {
 	inModule(t, func() {
 		var out bytes.Buffer
-		if err := inspect(&out, []string{"./pkg"}, "amd64", false); err != nil {
+		if err := inspect(&out, []string{"./pkg"}, "amd64", false, layout.Options{}); err != nil {
 			t.Fatal(err)
 		}
 		got := out.String()
@@ -111,7 +117,7 @@ func TestInspectReportsLayouts(t *testing.T) {
 func TestInspectVerboseShowsOffsetsAndPadding(t *testing.T) {
 	inModule(t, func() {
 		var out bytes.Buffer
-		if err := inspect(&out, []string{"./pkg"}, "amd64", true); err != nil {
+		if err := inspect(&out, []string{"./pkg"}, "amd64", true, layout.Options{}); err != nil {
 			t.Fatal(err)
 		}
 		want := "    current layout:\n" +
@@ -131,7 +137,7 @@ func TestInspectVerboseShowsOffsetsAndPadding(t *testing.T) {
 func TestInspectSuggestedOrder(t *testing.T) {
 	inModule(t, func() {
 		var out bytes.Buffer
-		if err := inspect(&out, []string{"./pkg"}, "amd64", false); err != nil {
+		if err := inspect(&out, []string{"./pkg"}, "amd64", false, layout.Options{}); err != nil {
 			t.Fatal(err)
 		}
 		got := out.String()
@@ -151,7 +157,7 @@ func TestInspectSuggestedOrder(t *testing.T) {
 func TestInspectArchitecture(t *testing.T) {
 	inModule(t, func() {
 		var out bytes.Buffer
-		if err := inspect(&out, []string{"./pkg"}, "386", false); err != nil {
+		if err := inspect(&out, []string{"./pkg"}, "386", false, layout.Options{}); err != nil {
 			t.Fatal(err)
 		}
 		// On 386, slices and strings are half the size and uint64 aligns to 4:
@@ -159,8 +165,113 @@ func TestInspectArchitecture(t *testing.T) {
 		if got := out.String(); !strings.Contains(got, "Broken: 36 bytes (30 data + 6 padding), could be 32 (saves 4)") {
 			t.Errorf("unexpected 386 layout:\n%s", got)
 		}
-		if err := inspect(&out, []string{"./pkg"}, "z80", false); err == nil {
+		if err := inspect(&out, []string{"./pkg"}, "z80", false, layout.Options{}); err == nil {
 			t.Error("expected an error for an unknown architecture")
 		}
 	})
+}
+
+// heapMix covers every kind of pointer-holding field. It is declared here for
+// reflect and, identically, as source text for inspect.
+type heapMix struct {
+	N     int64
+	S     string
+	Arr   [3]string
+	I     any
+	Inner struct {
+		X int64
+		P *int
+	}
+	U     uintptr
+	Bytes [16]byte
+}
+
+const heapMixSource = `package pkg
+
+type HeapMix struct {
+	N     int64
+	S     string
+	Arr   [3]string
+	I     any
+	Inner struct {
+		X int64
+		P *int
+	}
+	U     uintptr
+	Bytes [16]byte
+}
+`
+
+// reflectPointerBytes is the runtime-side reference for pointerBytes.
+func reflectPointerBytes(t reflect.Type) int64 {
+	word := int64(unsafe.Sizeof(uintptr(0)))
+	switch t.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Chan, reflect.Func, reflect.UnsafePointer,
+		reflect.String, reflect.Slice:
+		return word
+	case reflect.Interface:
+		return 2 * word
+	case reflect.Array:
+		if e := reflectPointerBytes(t.Elem()); e > 0 && t.Len() > 0 {
+			return int64(t.Len()-1)*int64(t.Elem().Size()) + e
+		}
+	case reflect.Struct:
+		var end int64
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if p := reflectPointerBytes(f.Type); p > 0 {
+				end = max(end, int64(f.Offset)+p)
+			}
+		}
+		return end
+	}
+	return 0
+}
+
+// TestInspectHeapMatchesReflect: the go/types pointer analysis used by inspect
+// must agree with reflect, field by field and for the whole struct.
+func TestInspectHeapMatchesReflect(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("expected sizes assume a 64-bit platform")
+	}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "go.mod"), "module example.com/heapmix\n\ngo 1.21\n")
+	writeFile(t, filepath.Join(dir, "pkg", "m.go"), heapMixSource)
+	wd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+
+	var out bytes.Buffer
+	if err := inspect(&out, []string{"./pkg"}, "amd64", true, layout.Options{Heap: true}); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+
+	// HeapMix is already optimal in size: no suggestion, so no "could be".
+	if strings.Contains(got, "could be") {
+		t.Errorf("no suggestion is shown, so nothing should say \"could be\":\n%s", got)
+	}
+	// Multi-line types are printed on one line.
+	if !strings.Contains(got, "Inner struct{X int64; P *int} // 16 bytes, pointer") {
+		t.Errorf("anonymous struct field should be on one line:\n%s", got)
+	}
+
+	typ := reflect.TypeOf(heapMix{})
+	scan := reflectPointerBytes(typ)
+	if want := fmt.Sprintf("GC scans %d of %d bytes", scan, typ.Size()); !strings.Contains(got, want) {
+		t.Errorf("want %q (from reflect) in:\n%s", want, got)
+	}
+	// Every field reflect says holds pointers is marked, and no other.
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		marked := regexp.MustCompile(`(?m)^\s+\d+\s+` + f.Name + `\s.*, pointer$`).MatchString(got)
+		if hasPtr := reflectPointerBytes(f.Type) > 0; marked != hasPtr {
+			t.Errorf("field %s: marked as pointer %v, reflect says %v", f.Name, marked, hasPtr)
+		}
+	}
 }

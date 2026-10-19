@@ -5,7 +5,7 @@
 //
 //	aligncheck gen [-prefix name] [-f] <package-dir>
 //	aligncheck test [go test flags] [packages]
-//	aligncheck inspect [-arch name] [-v] [packages]
+//	aligncheck inspect [-arch name] [-v] [-heap] [-heap-first] [packages]
 //	aligncheck ls [root]
 //	aligncheck clean [-y] [root]
 //	aligncheck version
@@ -38,6 +38,7 @@ Usage:
   aligncheck gen [-prefix name] [-f] <package-dir>   generate <prefix>_test.go for a package
   aligncheck test [go test flags] [packages]         run the alignment tests (go test -run TestStructAlignments)
   aligncheck inspect [-arch name] [-v] [packages]    report struct layouts directly, without tests
+                                                     (-heap: allocation size and GC scan; -heap-first: suggest pointer fields first)
   aligncheck ls [root]                               list generated alignment tests
   aligncheck clean [-y] [root]                       remove generated alignment tests
   aligncheck version                                 print the version

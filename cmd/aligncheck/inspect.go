@@ -26,6 +26,8 @@ func runInspect(args []string) error {
 	flags := flag.NewFlagSet("inspect", flag.ContinueOnError)
 	arch := flags.String("arch", defaultArch(), "target architecture for sizes (e.g. amd64, arm64, 386)")
 	verbose := flags.Bool("v", false, "also show each struct's current layout: field offsets and padding")
+	heap := flags.Bool("heap", false, "also show heap allocation size and how much of each struct the GC scans")
+	heapFirst := flags.Bool("heap-first", false, "suggest layouts the GC scans least (implies -heap)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -33,7 +35,8 @@ func runInspect(args []string) error {
 	if len(patterns) == 0 {
 		patterns = []string{"."}
 	}
-	return inspect(os.Stdout, patterns, *arch, *verbose)
+	opts := layout.Options{Heap: *heap || *heapFirst, HeapFirst: *heapFirst}
+	return inspect(os.Stdout, patterns, *arch, *verbose, opts)
 }
 
 func defaultArch() string {
@@ -57,11 +60,12 @@ type listedPackage struct {
 
 // inspect type-checks the packages matching patterns and reports, for each
 // top-level struct, its size and the smallest size a reordering can reach.
-func inspect(w io.Writer, patterns []string, arch string, verbose bool) error {
+func inspect(w io.Writer, patterns []string, arch string, verbose bool, opts layout.Options) error {
 	sizes := types.SizesFor("gc", arch)
 	if sizes == nil {
 		return fmt.Errorf("unknown architecture %q", arch)
 	}
+	opts.WordSize = sizes.Sizeof(types.Typ[types.UnsafePointer])
 
 	pkgs, err := goList(patterns)
 	if err != nil {
@@ -74,7 +78,7 @@ func inspect(w io.Writer, patterns []string, arch string, verbose bool) error {
 		}
 	}
 
-	var inspected, improvable int
+	var inspected, improvable, scanImprovable int
 	var saved, padding int64
 	for _, p := range pkgs {
 		if p.DepOnly {
@@ -83,7 +87,7 @@ func inspect(w io.Writer, patterns []string, arch string, verbose bool) error {
 		if p.Error != nil {
 			return fmt.Errorf("%s: %s", p.ImportPath, p.Error.Err)
 		}
-		reports, err := inspectPackage(p, exports, sizes)
+		reports, err := inspectPackage(p, exports, sizes, opts)
 		if err != nil {
 			return err
 		}
@@ -93,6 +97,9 @@ func inspect(w io.Writer, patterns []string, arch string, verbose bool) error {
 			if r.Optimal < r.Size {
 				improvable++
 				saved += r.Size - r.Optimal
+			}
+			if opts.HeapFirst && r.ScanImprovable() {
+				scanImprovable++
 			}
 			printReport(w, r, verbose)
 		}
@@ -104,6 +111,10 @@ func inspect(w io.Writer, patterns []string, arch string, verbose bool) error {
 	}
 	fmt.Fprintf(w, "%s inspected (%s): %s of padding, %s\n",
 		layout.Plural(int64(inspected), "struct"), arch, layout.Plural(padding, "byte"), removable)
+	if opts.HeapFirst {
+		fmt.Fprintf(w, "%s could be scanned less by the GC with pointer fields first\n",
+			layout.Plural(int64(scanImprovable), "struct"))
+	}
 	return nil
 }
 
@@ -132,7 +143,7 @@ func goList(patterns []string) ([]listedPackage, error) {
 	return pkgs, nil
 }
 
-func inspectPackage(p listedPackage, exports map[string]string, sizes types.Sizes) ([]layout.Report, error) {
+func inspectPackage(p listedPackage, exports map[string]string, sizes types.Sizes, opts layout.Options) ([]layout.Report, error) {
 	fset := token.NewFileSet()
 	var files []*ast.File
 	for _, name := range p.GoFiles {
@@ -183,7 +194,7 @@ func inspectPackage(p listedPackage, exports map[string]string, sizes types.Size
 				pos := fset.Position(ts.Pos())
 				location := fmt.Sprintf("%s:%d", relPath(pos.Filename), pos.Line)
 				fields := fieldsOf(fset, astStruct, st, sizes)
-				reports = append(reports, layout.Analyze(location, ts.Name.Name, fields, sizes.Alignof(obj.Type())))
+				reports = append(reports, layout.AnalyzeWith(location, ts.Name.Name, fields, sizes.Alignof(obj.Type()), opts))
 			}
 		}
 	}
@@ -210,27 +221,66 @@ func fieldsOf(fset *token.FileSet, astStruct *ast.StructType, st *types.Struct, 
 	for i := range fields {
 		v := st.Field(i)
 		text := types.TypeString(v.Type(), types.RelativeTo(v.Pkg()))
-		if len(typeText) == len(fields) {
-			text = typeText[i]
+		if len(typeText) == len(fields) && !strings.Contains(typeText[i], "\n") {
+			text = typeText[i] // as written, unless it spans several lines
 		}
 		name := v.Name()
 		if v.Embedded() {
 			name = "" // embedded fields are written as just their type
 		}
-		fields[i] = layout.Field{Name: name, Type: text, Size: sizes.Sizeof(v.Type()), Align: sizes.Alignof(v.Type())}
+		fields[i] = layout.Field{Name: name, Type: text, Size: sizes.Sizeof(v.Type()), Align: sizes.Alignof(v.Type()),
+			Pointers: pointerBytes(v.Type(), sizes)}
 	}
 	return fields
 }
 
+// pointerBytes is how many bytes from the start of a value of type t the GC
+// must scan: the end of its last pointer word (the runtime's "ptrdata").
+func pointerBytes(t types.Type, sizes types.Sizes) int64 {
+	word := sizes.Sizeof(types.Typ[types.UnsafePointer])
+	switch u := t.Underlying().(type) {
+	case *types.Basic:
+		if u.Kind() == types.String || u.Kind() == types.UnsafePointer {
+			return word
+		}
+	case *types.Pointer, *types.Map, *types.Chan, *types.Signature, *types.Slice:
+		return word
+	case *types.Interface:
+		return 2 * word
+	case *types.Array:
+		if e := pointerBytes(u.Elem(), sizes); e > 0 && u.Len() > 0 {
+			return (u.Len()-1)*sizes.Sizeof(u.Elem()) + e
+		}
+	case *types.Struct:
+		vars := make([]*types.Var, u.NumFields())
+		for i := range vars {
+			vars[i] = u.Field(i)
+		}
+		offsets := sizes.Offsetsof(vars)
+		var end int64
+		for i, v := range vars {
+			if p := pointerBytes(v.Type(), sizes); p > 0 {
+				end = max(end, offsets[i]+p)
+			}
+		}
+		return end
+	}
+	return 0
+}
+
 func printReport(w io.Writer, r layout.Report, verbose bool) {
 	fmt.Fprintf(w, "%s: %s\n", r.Location, r.Headline())
+	if r.Options.Heap {
+		fmt.Fprintln(w, r.HeapLine())
+	}
+	suggest := r.ShowsSuggestion()
 	if verbose {
 		fmt.Fprint(w, "\n"+r.CurrentLayout())
 	}
-	if r.Optimal < r.Size {
+	if suggest {
 		fmt.Fprint(w, "\n"+r.SuggestedLayout())
 	}
-	if verbose || r.Optimal < r.Size {
+	if verbose || suggest {
 		fmt.Fprintln(w)
 	}
 }

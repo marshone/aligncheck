@@ -30,11 +30,11 @@ type (
 		C uint8
 	}
 	unavoidable struct {
-		Name     string
-		Head     uint64
-		Dialect  uint32
-		Lifetime uint8
-		Gen      uint64
+		Name    string
+		ID      uint64
+		Version uint32
+		Kind    uint8
+		Created int64
 	}
 	trailingZero struct {
 		ID   int64
@@ -153,7 +153,7 @@ func TestReportText(t *testing.T) {
 	}
 
 	u := reflect.TypeOf(unavoidable{})
-	ur := Analyze("memory.go:132", "BranchState", fieldsOf(u), int64(u.Align()))
+	ur := Analyze("record.go:3", "Record", fieldsOf(u), int64(u.Align()))
 	if !strings.Contains(ur.Headline(), "optimal: the 3 padding bytes are unavoidable") {
 		t.Errorf("unexpected headline: %s", ur.Headline())
 	}

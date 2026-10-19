@@ -11,10 +11,11 @@ import (
 
 // Field is one struct field as declared.
 type Field struct {
-	Name  string // empty for embedded fields, which are written as just their type
-	Type  string // type as written in the source
-	Size  int64
-	Align int64
+	Name     string // empty for embedded fields, which are written as just their type
+	Type     string // type as written in the source
+	Size     int64
+	Align    int64
+	Pointers int64 // bytes from the field's start through its last pointer word; 0 if it holds no pointers
 }
 
 // Placed is a field at its position in a layout.
@@ -35,20 +36,81 @@ type Report struct {
 	Optimal   int64 // smallest size any field order can reach
 	Current   []Placed
 	Suggested []Field // optimal order
+
+	Scan          int64 // bytes the GC scans in the current layout (0: no pointers)
+	SuggestedScan int64 // bytes the GC scans in the suggested layout
+	Options       Options
+}
+
+// Options adjust the analysis and the report text.
+type Options struct {
+	Heap      bool  // report heap allocation size and GC scan length
+	HeapFirst bool  // among equally small layouts, suggest the one the GC scans least
+	WordSize  int64 // pointer size in bytes; 8 if zero
 }
 
 // Analyze lays out fields in declaration order and in optimal order. align is
 // the struct's alignment (the largest field alignment, at least 1).
 func Analyze(location, name string, fields []Field, align int64) Report {
+	return AnalyzeWith(location, name, fields, align, Options{})
+}
+
+// AnalyzeWith is Analyze with options.
+func AnalyzeWith(location, name string, fields []Field, align int64, opts Options) Report {
+	if opts.WordSize == 0 {
+		opts.WordSize = 8
+	}
 	current, size := Place(fields, align)
 	var data int64
 	for _, f := range fields {
 		data += f.Size
 	}
 	suggested := Optimal(fields)
-	_, optimal := Place(suggested, align)
+	if opts.HeapFirst {
+		suggested = HeapFirst(fields)
+	}
+	placedSuggested, optimal := Place(suggested, align)
 	return Report{Location: location, Name: name, Size: size, Data: data,
-		Optimal: optimal, Current: current, Suggested: suggested}
+		Optimal: optimal, Current: current, Suggested: suggested,
+		Scan: scanEnd(current), SuggestedScan: scanEnd(placedSuggested), Options: opts}
+}
+
+// HeapFirst is Optimal, except that within each alignment group the fields
+// holding pointers come first, ordered so the GC can stop scanning as early
+// as possible. Reordering within an alignment group never adds padding.
+func HeapFirst(fields []Field) []Field {
+	out := append([]Field(nil), fields...)
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if (a.Size == 0) != (b.Size == 0) {
+			return a.Size == 0
+		}
+		if a.Align != b.Align {
+			return a.Align > b.Align
+		}
+		if (a.Pointers > 0) != (b.Pointers > 0) {
+			return a.Pointers > 0
+		}
+		if a.Pointers > 0 {
+			// The scan ends inside the last pointer field: put the one with
+			// the most non-pointer bytes after its pointers last.
+			return a.Size-a.Pointers < b.Size-b.Pointers
+		}
+		return a.Size > b.Size
+	})
+	return out
+}
+
+// scanEnd is how many bytes from the start the GC must scan: the end of the
+// last pointer word in the layout.
+func scanEnd(placed []Placed) int64 {
+	var end int64
+	for _, p := range placed {
+		if p.Pointers > 0 {
+			end = max(end, p.Offset+p.Pointers)
+		}
+	}
+	return end
 }
 
 // Optimal returns the fields in an order with the smallest size. Every Go
@@ -146,12 +208,25 @@ func (r Report) CurrentLayout() string {
 		}
 	}
 	for _, p := range r.Current {
-		fmt.Fprintf(&b, "    %5d  %-*s // %s\n", p.Offset, typeWidth, decl(p.Field, nameWidth), Plural(p.Size, "byte"))
+		fmt.Fprintf(&b, "    %5d  %-*s // %s\n", p.Offset, typeWidth, decl(p.Field, nameWidth), r.sizeNote(p.Field))
+		if r.Options.Heap && r.Scan > 0 && p.Pointers > 0 && p.Offset+p.Pointers == r.Scan {
+			fmt.Fprintf(&b, "           -- GC scan ends at %d --\n", r.Scan)
+		}
 		if p.Padding > 0 {
 			fmt.Fprintf(&b, "    %5d  %-*s // %s\n", p.Offset+p.Size, typeWidth, padLabel(p), Plural(p.Padding, "byte"))
 		}
 	}
 	return b.String()
+}
+
+// sizeNote is the trailing comment of a field line: its size, and with the
+// heap view whether it holds pointers.
+func (r Report) sizeNote(f Field) string {
+	note := Plural(f.Size, "byte")
+	if r.Options.Heap && f.Pointers > 0 {
+		note += ", pointer"
+	}
+	return note
 }
 
 func padLabel(p Placed) string {
@@ -167,7 +242,7 @@ func (r Report) SuggestedLayout() string {
 	fmt.Fprintf(&b, "    suggested layout:\n    type %s struct {\n", r.Name)
 	nameWidth, typeWidth := widths(r.Suggested)
 	for _, f := range r.Suggested {
-		fmt.Fprintf(&b, "        %-*s // %s\n", typeWidth, decl(f, nameWidth), Plural(f.Size, "byte"))
+		fmt.Fprintf(&b, "        %-*s // %s\n", typeWidth, decl(f, nameWidth), r.sizeNote(f))
 	}
 	b.WriteString("    }\n")
 	return b.String()
